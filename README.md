@@ -22,7 +22,9 @@ possible that this won't compile correctly on older versions.
 # Build kchat_mod.ko, the kernel module
 $ make
 
-# Build the c client (although you can use cat if you just want to read)
+# Build the c client (optional)
+# -> You can also use `cat` to read messages (not tail for some reason)
+# -> You can use `dd of=filename` to write messages
 $ gcc -o kchat_client kchat_client.c
 
 # Load the kernel module
@@ -62,10 +64,10 @@ you're interested at all in kernel development, buy it from Amazon and stick it
 under your pillow at night.
 
 I managed to hack together a good enough understanding of polling and wait
-queues to make the files work with both blocking non-blocking I/O, thanks to the
-information from the *Linux Device Drivers, 3rd Edition*, which I accessed
-from [here](http://www.makelinux.net/ldd3/). Especially see Sections 6.2 and
-6.3!
+queues to make the files work with both blocking and non-blocking I/O, thanks to
+the information from the *Linux Device Drivers, 3rd Edition*, which I accessed
+from [here](http://www.makelinux.net/ldd3/). Especially relevant are Sections
+6.2 and 6.3!
 
 License
 -------
