@@ -49,8 +49,26 @@ the [client](kchat_client.c). It is really just reading, writing, and selecting
 from a couple files. If you looked at it, you wouldn't believe that it was a
 chat system!
 
+References
+----------
+
+My original inspiration came from the Linux Kernel Module Programming Guide,
+especially the chapter on character devices. Check that
+out [here](http://www.tldp.org/LDP/lkmpg/2.6/html/lkmpg.html#AEN567).
+
+I was able to competently use data structures and locking primitives within the
+kernel thanks to *Linux Kernel Development, Third Edition* by Robert Love. If
+you're interested at all in kernel development, buy it from Amazon and stick it
+under your pillow at night.
+
+I managed to hack together a good enough understanding of polling and wait
+queues to make the files work with both blocking non-blocking I/O, thanks to the
+information from the *Linux Device Drivers, 3rd Edition*, which I accessed
+from [here](http://www.makelinux.net/ldd3/). Especially see Sections 6.2 and
+6.3!
+
 License
 -------
 
 As I normally do, this is released under the BSD 3 Clause license.
-Check [LICENSE.txt][] for more info.
+Check [LICENSE.txt]() for more info.
