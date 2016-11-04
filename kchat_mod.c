@@ -7,14 +7,15 @@
 
 #include <linux/kernel.h>   /* it's the kernel yo */
 #include <linux/module.h>   /* it's a module yo */
-#include <linux/init.h>	    /* for module_{init,exit} */
-#include <linux/slab.h>	    /* kmalloc */
-#include <linux/fs.h>	    /* file_operations, file, etc... */
-#include <linux/list.h>	    /* all the list stuff */
+#include <linux/init.h>     /* for module_{init,exit} */
+#include <linux/slab.h>     /* kmalloc */
+#include <linux/fs.h>       /* file_operations, file, etc... */
+#include <linux/list.h>     /* all the list stuff */
 #include <linux/mutex.h>    /* struct mutex */
 #include <linux/rwsem.h>    /* struct rw_semaphore */
-#include <linux/poll.h>	    /* for the polling/select stuff! */
-#include <linux/wait.h>	    /* for wait queues */
+#include <linux/poll.h>     /* for the polling/select stuff! */
+#include <linux/sched.h>    /* wait.h doesn't always include this */
+#include <linux/wait.h>     /* for wait queues */
 #include <asm/uaccess.h>    /* for put_user */
 
 #define KCHAT_VMAJOR 0
