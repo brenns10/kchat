@@ -7,12 +7,14 @@
 
 #include <linux/kernel.h>   /* it's the kernel yo */
 #include <linux/module.h>   /* it's a module yo */
-#include <linux/init.h>     /* for module_{init,exit} */
-#include <linux/slab.h>     /* kmalloc */
-#include <linux/fs.h>       /* file_operations, file, etc... */
-#include <linux/list.h>     /* all the list stuff */
+#include <linux/init.h>	    /* for module_{init,exit} */
+#include <linux/slab.h>	    /* kmalloc */
+#include <linux/fs.h>	    /* file_operations, file, etc... */
+#include <linux/list.h>	    /* all the list stuff */
 #include <linux/mutex.h>    /* struct mutex */
 #include <linux/rwsem.h>    /* struct rw_semaphore */
+#include <linux/poll.h>	    /* for the polling/select stuff! */
+#include <linux/wait.h>	    /* for wait queues */
 #include <asm/uaccess.h>    /* for put_user */
 
 #define KCHAT_VMAJOR 0
@@ -28,15 +30,18 @@ static int kchat_open(struct inode *, struct file *);
 static int kchat_flush(struct file *, fl_owner_t);
 static ssize_t kchat_read(struct file *, char *, size_t, loff_t *);
 static ssize_t kchat_write(struct file *, const char *, size_t, loff_t *);
+static unsigned int kchat_poll(struct file *, poll_table *);
 
 /*
  * Chat server exists per-inode.
  */
 struct kchat_server {
 	struct inode *inode;
-	struct list_head server_list; /* CONTAINED IN this list */
-	struct list_head client_list; /* CONTAINS this list */
-	struct mutex client_list_lock; /* protects client_list */
+	struct list_head server_list; // CONTAINED IN this list
+	struct list_head client_list; // CONTAINS this list
+	struct mutex client_list_lock; // protects client_list
+	wait_queue_head_t rwq; // whom to wake when data is available
+	wait_queue_head_t wwq; // whom to wake when room is available
 	char buffer[KCHAT_BUF];
 	struct rw_semaphore buffer_lock;
 	int end;
@@ -73,6 +78,7 @@ static struct file_operations kchat_fops = {
 	.write = kchat_write,
 	.open = kchat_open,
 	.flush = kchat_flush,
+	.poll = kchat_poll,
 	.owner = THIS_MODULE
 };
 
@@ -97,6 +103,8 @@ static struct kchat_server *create_server(struct inode *inode)
 	INIT_LIST_HEAD(&srv->client_list);
 	mutex_init(&srv->client_list_lock);
 	init_rwsem(&srv->buffer_lock);
+	init_waitqueue_head(&srv->rwq);
+	init_waitqueue_head(&srv->wwq);
 	list_add(&srv->server_list, &server_list);
 	return srv;
 }
@@ -142,7 +150,8 @@ static void check_free_server(struct kchat_server *srv)
 
 /*
  * Return the offset of the client with the most unread data.
- * client_list_lock must be held for this server
+ * client_list_lock must be held for this server, as well as write lock if you
+ * want accurate numbers
  */
 static int blocking_offset(struct kchat_server *srv)
 {
@@ -156,6 +165,15 @@ static int blocking_offset(struct kchat_server *srv)
 		}
 	}
 	return offset;
+}
+
+static int room_to_write(struct kchat_server *srv)
+{
+	int maxidx;
+	mutex_lock_interruptible(&srv->client_list_lock);
+	maxidx = (blocking_offset(srv) + KCHAT_BUF - 1) % KCHAT_BUF;
+	mutex_unlock(&srv->client_list_lock);
+	return DIST(srv->end, maxidx);
 }
 
 /*
@@ -174,32 +192,12 @@ static struct kchat_client *create_client(struct file *filp,
 	cnt->server = srv;
 	INIT_LIST_HEAD(&cnt->client_list);
 	cnt->offset = srv->end; // prevent invalid data
+	filp->private_data = cnt;
 
 	mutex_lock_interruptible(&srv->client_list_lock);
 	list_add(&cnt->client_list, &srv->client_list);
 	mutex_unlock(&srv->client_list_lock);
 	return cnt;
-}
-
-/*
- * Get the chat client for a file.
- */
-static struct kchat_client *get_client(struct file *filp)
-{
-	struct kchat_server *srv;
-	struct kchat_client *cnt;
-	srv = get_server(filp->f_inode);
-
-	mutex_lock_interruptible(&srv->client_list_lock);
-	list_for_each_entry(cnt, &srv->client_list, client_list){
-		if (cnt->filp == filp) {
-			mutex_unlock(&srv->client_list_lock);
-			return cnt;
-		}
-	}
-	// presumably this won't happen, but should check for it if it does
-	mutex_unlock(&srv->client_list_lock);
-	return NULL;
 }
 
 /*
@@ -247,19 +245,14 @@ server_create_failed:
 static int kchat_flush(struct file *filp, fl_owner_t unused)
 {
 	struct kchat_client *cnt;
-  long count = atomic_long_read(&filp->f_count);
-  if (count != 1) {
-    printk(KERN_INFO "kchat: flush: filp=%p filp->f_count=%ld bailing!\n", filp,
-           count);
-    return SUCCESS;
-  }
-
-	cnt = get_client(filp);
-
-	if (!cnt) {
-		printk(KERN_INFO "kchat: flush: filp=%p no client\n", filp);
-		return -ENOENT;
+	long count = atomic_long_read(&filp->f_count);
+	if (count != 1) {
+		printk(KERN_INFO "kchat: flush: filp=%p filp->f_count=%ld bailing!\n", filp,
+		       count);
+		return SUCCESS;
 	}
+
+	cnt = filp->private_data;
 
 	mutex_lock_interruptible(&cnt->server->client_list_lock);
 	list_del(&cnt->client_list);
@@ -285,16 +278,27 @@ static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 	struct kchat_server *srv;
 	struct kchat_client *cnt;
 	int bytes_read = 0;
-	printk(KERN_INFO "kchat: read filp=%p\n", filp);
 
-	cnt = get_client(filp);
-	if (!cnt) {
-		printk(KERN_INFO "kchat: read couldn't find client\n");
-		return -ENOENT;
-	}
+	printk(KERN_INFO "kchat: read: filp=%p WAIT FOR DATA\n", filp);
+	cnt = filp->private_data;
 	srv = cnt->server;
 
+	// acquire buffer read lock to ensure amount of data doesn't change
 	down_read(&srv->buffer_lock);
+
+	// wait till we have data
+	while (DIST(cnt->offset, srv->end) == 0) {
+		up_read(&srv->buffer_lock);
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (wait_event_interruptible(srv->rwq, DIST(cnt->offset, srv->end) != 0))
+			return -ERESTARTSYS;
+		down_read(&srv->buffer_lock);
+	}
+
+	printk(KERN_INFO "kchat: read: filp=%p READING length=%zu srv->end=%d cnt->offset=%d\n",
+	       filp, length, srv->end, cnt->offset);
+
 	while (length && DIST(cnt->offset, srv->end) > 0) {
 		put_user(srv->buffer[cnt->offset], usrbuf++);
 		length--;
@@ -302,24 +306,41 @@ static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 		bytes_read++;
 	}
 	up_read(&srv->buffer_lock);
-	printk(KERN_INFO "kchat: read: wrote %d bytes\n", bytes_read);
+
+	printk(KERN_INFO "kchat: read: filp=%p READ %d, length=%zu srv->end=%d cnt->offset=%d\n",
+	       filp, bytes_read, length, srv->end, cnt->offset);
+	wake_up(&srv->wwq); // there may be more room now that we've read
 	return bytes_read;
 }
 
 /*
  * Return whether or not there is any data for this file to read.
  */
-unsigned int kchat_poll(struct file *filp, struct poll_table_struct *unused)
+static unsigned int kchat_poll(struct file *filp, poll_table *tbl)
 {
 	struct kchat_client *cnt;
 	struct kchat_server *srv;
-	cnt = get_client(filp);
-	printk(KERN_INFO "kchat: poll filp=%p\n", filp);
-	if (!cnt)
-		return false;
+	int mask = 0;
+
+	cnt = filp->private_data;
 	srv = cnt->server;
-	/* guaranteed to be positive... */
-	return (unsigned int) DIST(cnt->offset, srv->end);
+
+	printk(KERN_INFO "kchat: poll filp=%p\n", filp);
+	poll_wait(filp, &srv->rwq, tbl);
+	poll_wait(filp, &srv->wwq, tbl);
+
+	down_write(&srv->buffer_lock);
+
+	mask = 0;
+	if (DIST(cnt->offset, srv->end) > 0) {
+		mask |= POLLIN | POLLRDNORM;
+	}
+	if (room_to_write(srv) > 0) {
+		mask |= POLLOUT | POLLWRNORM;
+	}
+
+	up_write(&srv->buffer_lock);
+	return mask;
 }
 
 ssize_t kchat_write(struct file *filp, const char *usrbuf, size_t amt,
@@ -327,39 +348,38 @@ ssize_t kchat_write(struct file *filp, const char *usrbuf, size_t amt,
 {
 	struct kchat_client *cnt;
 	struct kchat_server *srv;
-
-	int maxidx;
+	int room;
 	int bytes_written = 0;
 
-	cnt = get_client(filp);
-	if (!cnt) {
-		printk(KERN_INFO "kchat: write: filp=%p couldn't get client\n", filp);
-		return -ENOENT;
-	}
+	cnt = filp->private_data;
 	srv = cnt->server;
+	printk(KERN_INFO "kchat: write: filp=%p WAIT FOR ROOM\n", filp);
 
-	// determine how far we can write before we encounter space a client
-	// has not read yet
-	mutex_lock_interruptible(&srv->client_list_lock);
-	maxidx = (blocking_offset(srv) + KCHAT_BUF - 1) % KCHAT_BUF;
-	mutex_unlock(&srv->client_list_lock);
-
-	printk(KERN_INFO "kchat: write filp=%p maxidx=%d cnt->offset=%d srv->end=%d\n",
-	       filp, maxidx, cnt->offset, srv->end);
-
-	// copy as much data from user space into the buffer
 	down_write(&srv->buffer_lock);
-	while (srv->end != maxidx && amt > 0) {
+
+	// wait until there is room to write
+	while ((room = room_to_write(srv)) == 0) {
+		up_write(&srv->buffer_lock);
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (wait_event_interruptible(srv->wwq, room_to_write(srv) > 0))
+			return -ERESTARTSYS;
+		down_write(&srv->buffer_lock);
+	}
+
+	printk(KERN_INFO "kchat: write: filp=%p WRITING room=%d amt=%zu srv->end=%d\n",
+	       filp, room, amt, srv->end);
+
+	while (room > 0 && amt > 0) {
 		get_user(srv->buffer[srv->end], usrbuf++);
 		srv->end = (srv->end + 1) % KCHAT_BUF;
-		amt--;
-		bytes_written++;
+		amt--; room--; bytes_written++;
 	}
 	up_write(&srv->buffer_lock);
 
-	printk(KERN_INFO "kchat: write: filp=%p wrote %d bytes\n", filp,
-	       bytes_written);
-
+	printk(KERN_INFO "kchat: write: filp=%p WROTE %d, room=%d amt=%zu srv->end=%d\n",
+	       filp, bytes_written, room, amt, srv->end);
+	wake_up(&srv->rwq); // there is more data for readers
 	return bytes_written;
 }
 
