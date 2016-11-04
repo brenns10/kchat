@@ -167,6 +167,13 @@ static int blocking_offset(struct kchat_server *srv)
 	return offset;
 }
 
+/*
+ * Convenience function for determining how many bytes we have room to write in
+ * our buffer. It grabs the client_list lock, finds the offset with the most
+ * unread data, and goes ONE BEFORE it (because if end==offset, we expect that
+ * there is no data to read). Then it computes the distance from the end of the
+ * data to this offset: which is the amount of room we have for writing.
+ */
 static int room_to_write(struct kchat_server *srv)
 {
 	int maxidx;
@@ -177,7 +184,9 @@ static int room_to_write(struct kchat_server *srv)
 }
 
 /*
- * Create a new client for a server.
+ * Create a new client for a server. Client objects are stored within struct
+ * file's private_data field, so there is no need for any special lookup from
+ * the client list when you want this client again.
  */
 static struct kchat_client *create_client(struct file *filp,
 					  struct kchat_server *srv)
@@ -239,8 +248,20 @@ server_create_failed:
 }
 
 /*
- * Flush ~= close - destroy a client if the filp is going away, and maybe the
- * server
+ * Flush - called when a process closes their file descriptor, and so any
+ * buffered data of theirs should be flushed. We use this as a notification when
+ * close() is called so that we can free the client and optionally the server
+ * when it has no more clients.
+ *
+ * NOTE Due to fork() or dup(), multiple processes and file descriptors can
+ * refer to the same struct file!! If any of them are closed, this will be
+ * called. Therefore, we check the f_count value to ensure that no more file
+ * descriptors are using this file before we free it.
+ *
+ * NOTE This is just for safety. If two processes/threads have the same file
+ * instance and they both read/write, bad things will happen and I'll yell at
+ * them. I just would prefer to not make the kernel segfault when one of them
+ * closes their copy.
  */
 static int kchat_flush(struct file *filp, fl_owner_t unused)
 {
@@ -268,9 +289,7 @@ static int kchat_flush(struct file *filp, fl_owner_t unused)
 }
 
 /*
- * Read - read from the server
- * Should not require any locks, since the "active" region of the buffer is
- * guaranteed not to be modified.
+ * Read - read from the server. This has blocking and non-blocking variations.
  */
 static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 			  loff_t *offset)
@@ -314,7 +333,9 @@ static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 }
 
 /*
- * Return whether or not there is any data for this file to read.
+ * Return information about whether the file is ready to read or write.
+ * Additionally register our wait queues with the poll table so that the select
+ * and poll system calls can wake when the state changes.
  */
 static unsigned int kchat_poll(struct file *filp, poll_table *tbl)
 {
@@ -329,6 +350,10 @@ static unsigned int kchat_poll(struct file *filp, poll_table *tbl)
 	poll_wait(filp, &srv->rwq, tbl);
 	poll_wait(filp, &srv->wwq, tbl);
 
+	/*
+	 * We need the write lock here so that we can be certain no readers are
+	 * reading, and thus updating their offsets while we check them.
+	 */
 	down_write(&srv->buffer_lock);
 
 	mask = 0;
@@ -343,6 +368,11 @@ static unsigned int kchat_poll(struct file *filp, poll_table *tbl)
 	return mask;
 }
 
+/*
+ * Write - Put user data into the buffer. Supports blocking and non-blocking
+ * variations. Requires mutual exclusion from all readers and writers for
+ * safety.
+ */
 ssize_t kchat_write(struct file *filp, const char *usrbuf, size_t amt,
 		    loff_t *unused)
 {
