@@ -22,10 +22,10 @@
 
 #define DEVICE_NAME "kchat"
 #define KCHAT_BUF 2048
-#define DIST(a, b) ((a) < (b) ? (b) - (a) : KCHAT_BUF + (b) - (a))
+#define DIST(a, b) ((a) <= (b) ? (b) - (a) : KCHAT_BUF + (b) - (a))
 
 static int kchat_open(struct inode *, struct file *);
-static int kchat_release(struct inode *, struct file *);
+static int kchat_flush(struct file *, fl_owner_t);
 static ssize_t kchat_read(struct file *, char *, size_t, loff_t *);
 static ssize_t kchat_write(struct file *, const char *, size_t, loff_t *);
 
@@ -72,7 +72,7 @@ static struct file_operations kchat_fops = {
 	.read = kchat_read,
 	.write = kchat_write,
 	.open = kchat_open,
-	.release = kchat_release,
+	.flush = kchat_flush,
 	.owner = THIS_MODULE
 };
 
@@ -97,7 +97,7 @@ static struct kchat_server *create_server(struct inode *inode)
 	INIT_LIST_HEAD(&srv->client_list);
 	mutex_init(&srv->client_list_lock);
 	init_rwsem(&srv->buffer_lock);
-	list_add(&server_list, &srv->server_list);
+	list_add(&srv->server_list, &server_list);
 	return srv;
 }
 
@@ -113,6 +113,8 @@ static struct kchat_server *get_server(struct inode *inode)
 			return srv;
 		}
 	}
+	printk(KERN_INFO "kchat: get_server: inode=%p creating new server\n",
+	       inode);
 	srv = create_server(inode);
 	return srv;
 }
@@ -129,8 +131,10 @@ static void check_free_server(struct kchat_server *srv)
 	if (list_empty(&srv->client_list)) {
 		// remove us from the server list
 		list_del(&srv->server_list);
+		printk(KERN_INFO "kchat: check_free_server: freeing srv->inode=%p\n", srv->inode);
 		kfree(srv);
 	} else {
+		printk(KERN_INFO "kchat: check_free_server: not freeing srv->inode=%p\n", srv->inode);
 		// only release the client list lock if there are still clients
 		mutex_unlock(&srv->client_list_lock);
 	}
@@ -172,7 +176,7 @@ static struct kchat_client *create_client(struct file *filp,
 	cnt->offset = srv->end; // prevent invalid data
 
 	mutex_lock_interruptible(&srv->client_list_lock);
-	list_add(&srv->client_list, &cnt->client_list);
+	list_add(&cnt->client_list, &srv->client_list);
 	mutex_unlock(&srv->client_list_lock);
 	return cnt;
 }
@@ -223,6 +227,8 @@ static int kchat_open(struct inode * inode, struct file *filp)
 		goto client_create_failed;
 
 	mutex_unlock(&server_list_lock);
+	printk(KERN_INFO "kchat: open: inode=%p filp=%p opened file!\n",
+	       inode, filp);
 	return SUCCESS;
 
 client_create_failed:
@@ -230,20 +236,30 @@ client_create_failed:
 	check_free_server(srv);
 server_create_failed:
 	mutex_unlock(&server_list_lock);
+	printk(KERN_INFO "kchat: open: inode=%p filp=%p fail\n", inode, filp);
 	return -ENOMEM;
 }
 
 /*
- * Close - destroy a client, and maybe the server
+ * Flush ~= close - destroy a client if the filp is going away, and maybe the
+ * server
  */
-static int kchat_release(struct inode *inode, struct file *filp)
+static int kchat_flush(struct file *filp, fl_owner_t unused)
 {
 	struct kchat_client *cnt;
+  long count = atomic_long_read(&filp->f_count);
+  if (count != 1) {
+    printk(KERN_INFO "kchat: flush: filp=%p filp->f_count=%ld bailing!\n", filp,
+           count);
+    return SUCCESS;
+  }
 
 	cnt = get_client(filp);
 
-	if (!cnt)
+	if (!cnt) {
+		printk(KERN_INFO "kchat: flush: filp=%p no client\n", filp);
 		return -ENOENT;
+	}
 
 	mutex_lock_interruptible(&cnt->server->client_list_lock);
 	list_del(&cnt->client_list);
@@ -254,6 +270,7 @@ static int kchat_release(struct inode *inode, struct file *filp)
 	mutex_unlock(&server_list_lock);
 
 	kfree(cnt);
+	printk(KERN_INFO "kchat: flush: filp=%p freed client\n", filp);
 	return SUCCESS;
 }
 
@@ -268,10 +285,13 @@ static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 	struct kchat_server *srv;
 	struct kchat_client *cnt;
 	int bytes_read = 0;
+	printk(KERN_INFO "kchat: read filp=%p\n", filp);
 
 	cnt = get_client(filp);
-	if (!cnt)
+	if (!cnt) {
+		printk(KERN_INFO "kchat: read couldn't find client\n");
 		return -ENOENT;
+	}
 	srv = cnt->server;
 
 	down_read(&srv->buffer_lock);
@@ -282,6 +302,7 @@ static ssize_t kchat_read(struct file *filp, char *usrbuf, size_t length,
 		bytes_read++;
 	}
 	up_read(&srv->buffer_lock);
+	printk(KERN_INFO "kchat: read: wrote %d bytes\n", bytes_read);
 	return bytes_read;
 }
 
@@ -293,6 +314,7 @@ unsigned int kchat_poll(struct file *filp, struct poll_table_struct *unused)
 	struct kchat_client *cnt;
 	struct kchat_server *srv;
 	cnt = get_client(filp);
+	printk(KERN_INFO "kchat: poll filp=%p\n", filp);
 	if (!cnt)
 		return false;
 	srv = cnt->server;
@@ -310,18 +332,23 @@ ssize_t kchat_write(struct file *filp, const char *usrbuf, size_t amt,
 	int bytes_written = 0;
 
 	cnt = get_client(filp);
-	if (!cnt)
+	if (!cnt) {
+		printk(KERN_INFO "kchat: write: filp=%p couldn't get client\n", filp);
 		return -ENOENT;
+	}
 	srv = cnt->server;
 
 	// determine how far we can write before we encounter space a client
 	// has not read yet
 	mutex_lock_interruptible(&srv->client_list_lock);
-	maxidx = blocking_offset(srv);
+	maxidx = (blocking_offset(srv) + KCHAT_BUF - 1) % KCHAT_BUF;
 	mutex_unlock(&srv->client_list_lock);
 
+	printk(KERN_INFO "kchat: write filp=%p maxidx=%d cnt->offset=%d srv->end=%d\n",
+	       filp, maxidx, cnt->offset, srv->end);
+
 	// copy as much data from user space into the buffer
-  down_write(&srv->buffer_lock);
+	down_write(&srv->buffer_lock);
 	while (srv->end != maxidx && amt > 0) {
 		get_user(srv->buffer[srv->end], usrbuf++);
 		srv->end = (srv->end + 1) % KCHAT_BUF;
@@ -329,6 +356,9 @@ ssize_t kchat_write(struct file *filp, const char *usrbuf, size_t amt,
 		bytes_written++;
 	}
 	up_write(&srv->buffer_lock);
+
+	printk(KERN_INFO "kchat: write: filp=%p wrote %d bytes\n", filp,
+	       bytes_written);
 
 	return bytes_written;
 }
@@ -345,9 +375,9 @@ static int __init init_kchat(void)
 		return major;
 	}
 
-	printk(KERN_INFO "kchat v%d.%d -- assigned major number %d",
+	printk(KERN_INFO "kchat v%d.%d -- assigned major number %d\n",
 	       KCHAT_VMAJOR, KCHAT_VMINOR, major);
-	printk(KERN_INFO "'mknod <filename> c %d 0' to make chat file!", major);
+	printk(KERN_INFO "'mknod <filename> c %d 0' to make chat file!\n", major);
 	return SUCCESS;
 }
 
@@ -356,7 +386,7 @@ static void __exit exit_kchat(void)
 	unregister_chrdev(major, DEVICE_NAME);
 	if (!list_empty(&server_list)) {
 		printk(KERN_ALERT "Uh-oh: kchat module unloaded without "
-		       "all files being closed!");
+		       "all files being closed!\n");
 	}
 }
 
