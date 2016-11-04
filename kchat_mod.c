@@ -415,4 +415,4 @@ module_exit(exit_kchat);
 
 MODULE_AUTHOR("Stephen Brennan <stephen@brennan.io>");
 MODULE_DESCRIPTION("Driver for simple chat between processes.");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("BSD 3 Clause");
